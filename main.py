@@ -1,45 +1,44 @@
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy.orm import Session
-from openai import OpenAI
-from google import genai
-import httpx
+# main.py
 import os
+from fastapi import FastAPI, Depends, HTTPException, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db
-from models import Item, MonicaSession, MonicaMessage
+from models import Item, MonicaSession
 from database_models import (
-    ItemCreate, ItemResponse, AIRequest, AIResponse,
-    MonicaChatRequest, MonicaSessionResponse, MonicaReply
+    ItemCreate,
+    ItemResponse,
+    MonicaChatRequest,
+    MonicaSessionResponse,
+    MonicaReply,
 )
 from monica_service import MonicaAgent
 
-from fastapi.middleware.cors import CORSMiddleware
+# -------------------------------------------------
+# App Setup
+# -------------------------------------------------
 
-app = FastAPI()
+app = FastAPI(title="Agent Monica 007")
 
-# Add CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For production, replace with specific origins
+    allow_origins=["*"],  # tighten in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize Monica Agent
-monica_agent = MonicaAgent()
-
-# Create database tables
+# Create tables (safe with Postgres)
 Base.metadata.create_all(bind=engine)
 
-# AI Service Clients Initialization
-def get_openai_client():
-    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Singleton Agent Brain
+monica_agent = MonicaAgent()
 
-def get_gemini_client():
-    return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# -------------------------------------------------
+# Monica Routes
+# -------------------------------------------------
 
-# -------- Monica Agent Routes --------
 @app.post("/monica/session", response_model=MonicaSessionResponse)
 def create_monica_session(db: Session = Depends(get_db)):
     session = MonicaSession()
@@ -48,26 +47,86 @@ def create_monica_session(db: Session = Depends(get_db)):
     db.refresh(session)
     return session
 
+
 @app.post("/monica/chat", response_model=MonicaReply)
-async def monica_chat(request: MonicaChatRequest, db: Session = Depends(get_db)):
-    session = db.query(MonicaSession).filter(MonicaSession.id == request.session_id).first()
+async def monica_chat(
+    request: MonicaChatRequest, db: Session = Depends(get_db)
+):
+    session = (
+        db.query(MonicaSession)
+        .filter(MonicaSession.id == request.session_id)
+        .first()
+    )
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     try:
         reply = await monica_agent.get_reply(db, session, request.text)
         return reply
     except Exception as e:
+        import traceback
+        traceback.print_exc()   # <-- ADD THIS
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/monica/session/{session_id}", response_model=MonicaSessionResponse)
-def get_monica_session(session_id: int, db: Session = Depends(get_db)):
-    session = db.query(MonicaSession).filter(MonicaSession.id == session_id).first()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+
+@app.post("/monica/session", response_model=MonicaSessionResponse)
+def create_monica_session(db: Session = Depends(get_db)):
+    session = MonicaSession()
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+
+    # Seed first Monica message
+    greeting = (
+        "Welcome to the pitching module. "
+        "Please tell me your name, your role (BM or PL), "
+        "your headquarter base, and your division."
+    )
+
+    from models import MonicaMessage
+
+    msg = MonicaMessage(
+        session_id=session.id,
+        role="assistant",
+        content=greeting,
+        stage="SETUP",
+        persona="COACH",
+    )
+    db.add(msg)
+    db.commit()
+
     return session
 
-# -------- Database Routes --------
+
+
+@app.websocket("/ws/monica/{session_id}")
+async def monica_ws(websocket: WebSocket, session_id: int):
+    """
+    Dedicated WebSocket for Voice Mode.
+    Each socket gets its own DB session.
+    """
+    db_gen = get_db()
+    db = next(db_gen)
+
+    try:
+        await monica_agent.connect_live_session(websocket, db, session_id)
+    except Exception as e:
+        print("WS Error:", e)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+# -------------------------------------------------
+# Sample DB Routes (Keep or Remove)
+# -------------------------------------------------
+
 @app.post("/items", response_model=ItemResponse)
 def create_item(item: ItemCreate, db: Session = Depends(get_db)):
     db_item = Item(name=item.name, description=item.description)
@@ -76,71 +135,7 @@ def create_item(item: ItemCreate, db: Session = Depends(get_db)):
     db.refresh(db_item)
     return db_item
 
+
 @app.get("/items", response_model=list[ItemResponse])
 def get_items(db: Session = Depends(get_db)):
     return db.query(Item).all()
-
-# -------- OpenAI Route --------
-@app.post("/ai/openai", response_model=AIResponse)
-async def ask_openai(request: AIRequest):
-    client = get_openai_client()
-    model = request.model or "gpt-4o-mini"
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": request.text}]
-        )
-        return {
-            "service": "OpenAI",
-            "response": response.choices[0].message.content,
-            "model_used": model
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# -------- Gemini Route --------
-@app.post("/ai/gemini", response_model=AIResponse)
-async def ask_gemini(request: AIRequest):
-    client = get_gemini_client()
-    model = request.model or "gemini-1.5-flash"
-    try:
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=request.text
-        )
-        return {
-            "service": "Gemini",
-            "response": response.text,
-            "model_used": model
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# -------- Perplexity Route --------
-@app.post("/ai/perplexity", response_model=AIResponse)
-async def ask_perplexity(request: AIRequest):
-    api_key = os.getenv("PERPLEXITY_API_KEY")
-    model = request.model or "llama-3.1-sonar-small-128k-online"
-    url = "https://api.perplexity.ai/chat/completions"
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": request.text}]
-    }
-
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-            return {
-                "service": "Perplexity",
-                "response": data["choices"][0]["message"]["content"],
-                "model_used": model
-            }
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))

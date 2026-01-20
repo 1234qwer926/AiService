@@ -1,13 +1,12 @@
 import React from 'react';
-import MonicaChat from './components/MonicaChat';
-import './App.css';
+import MonicaInterface from './components/MonicaInterface';
 
 function App() {
   return (
-    <div className="App">
-      <MonicaChat />
+    <div className="bg-[#0f0f0f] min-h-screen text-white font-inter">
+      <MonicaInterface />
     </div>
-  )
+  );
 }
 
-export default App
+export default App;

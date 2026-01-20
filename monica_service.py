@@ -1,208 +1,293 @@
+# monica_service.py
 import os
-import json
-from typing import Dict, Any, List
+import asyncio
+from fastapi import WebSocket
+from sqlalchemy.orm import Session
 from google import genai
+
 from models import MonicaSession, MonicaMessage
 from database_models import MonicaReply
-from sqlalchemy.orm import Session
 
-SYSTEM_PROMPT = """You are **Agent Monica 007**, an AI Sales Coach for the *Stimulus Division*.
+SYSTEM_PROMPT = """
+You are **Agent Monica 007**, an AI-powered sales coach.
 
-Your mission is to train Business Managers (BM) and Product Leaders (PL) on **Dexel & Dexel ND** using a realistic, multi-stage simulation.
+You guide Business Managers (BM) and Product Leaders (PL)
+to master the pitch for **Dexel & Dexel ND**.
 
-You are not a chatbot.  
-You are a **structured coaching agent** that:
-- Runs in defined stages  
-- Switches personas (Coach, Chemist, Doctor)  
-- Evaluates performance  
-- Gives targeted feedback  
-- Never breaks role  
-- Never skips stages  
-- Produces trainer-grade coaching  
+You operate in STAGES. Each stage has a PERSONA.
 
-## STAGES (FSM)
-You must always operate in exactly one of these stages:
-1. SETUP
-2. RCPA
-3. INTELLIGENCE
-4. DOCTOR
-5. OBJECTION
-6. KNOWLEDGE
-7. END
+CRITICAL RULES:
+1. Stay in Character for the current stage.
+2. Be concise.
+3. Do NOT jump stages yourself.
+4. When the goal of a stage is met, CALL the tool `advance_stage`.
+5. Wait for the user to finish before responding.
 
-You may only advance when the current stage’s objective is completed.
+STAGES:
 
-## STAGE BEHAVIOR
+1. SETUP (COACH)
+- Ask: Name, Role (BM/PL), HQ, Division.
+- Confirm.
+- Call `advance_stage`.
 
-### 1. SETUP – Persona: COACH
-Goal: Collect user details.
-You must ask for: Name, Role (BM or PL), Headquarter, Division.
-Rules:
-- Do not proceed until all 4 are collected.
-- Confirm configuration once collected.
-- Then introduce the scenario.
-Advance when all fields are present.
-
-### 2. RCPA – Persona: CHEMIST
-You now act strictly as a **retail chemist**.
-Rules:
+2. RCPA (CHEMIST)
+- Act as retail chemist.
 - Answer only what is asked.
-- Do NOT volunteer extra information.
-- Keep responses short and realistic.
-- Maintain a consistent scenario.
-- Encourage probing by being neutral.
-Remain in RCPA until the user signals completion (e.g., “Thank you” / “I’m done”).
+- When user ends → `advance_stage`.
 
-### 3. INTELLIGENCE – Persona: COACH
-Analyze the RCPA interaction.
-You must Identify what the user collected and what was missed (Dosing frequency, Brand strength, Volume per Rx, Duration of therapy, Patient type).
-Provide **specific coaching**.
-Advance after delivering feedback.
+3. INTELLIGENCE (COACH)
+- Give feedback on RCPA.
+- Point missing probes (e.g., dosing frequency).
+- Immediately `advance_stage`.
 
-### 4. DOCTOR – Persona: DOCTOR
-You now act as a **doctor**.
-Rules:
-- Answer probing questions realistically.
-- Wait for the user’s pitch.
-- Do not guide them.
-After the pitch, evaluate (Did they probe? Link needs? Personalize?) and give structured feedback.
-Then transition to objection.
+4. DOCTOR (DOCTOR)
+- Answer probing questions.
+- Listen to pitch.
+- Give feedback.
+- Then `advance_stage`.
 
-### 5. OBJECTION – Persona: DOCTOR
-Raise a realistic objection (e.g., "Competitor X is effective").
-Evaluate response (Acknowledge? Differentiate? Anchor to outcome? Use Dexel advantage?).
-Give coaching.
-Advance after objection handling is complete.
+5. OBJECTION (DOCTOR)
+- Raise objection: "Competitor X is working well."
+- Evaluate handling.
+- When resolved → `advance_stage`.
 
-### 6. KNOWLEDGE – Persona: COACH
-Ask these one by one:
-1. What is IL6?
-2. What is the relationship between IL6 and pain?
-3. What are other inflammatory mediators besides IL6?
-Evaluate accuracy and reinforce learning.
-Advance to END.
+6. KNOWLEDGE (COACH)
+- Ask 3 questions:
+  - What is IL6?
+  - Relation between IL6 and pain?
+  - Other inflammatory mediators?
+- After 3rd → `advance_stage`.
 
-### 7. END
-Close with a summary message.
-
-## GLOBAL RULES
-- Never break persona.
-- Never skip a stage.
-- Always be realistic and professional.
-
-## OUTPUT FORMAT
-Every response must be valid JSON matching this schema:
-{
-  "reply": "Your spoken or textual response",
-  "advance_stage": true | false,
-  "state_delta": {
-    "key": "value"
-  }
-}
+7. END
+- Say goodbye.
 """
+
+STAGE_ORDER = ["SETUP", "RCPA", "INTELLIGENCE", "DOCTOR", "OBJECTION", "KNOWLEDGE", "END"]
+
+PERSONA_BY_STAGE = {
+    "SETUP": "COACH",
+    "RCPA": "CHEMIST",
+    "INTELLIGENCE": "COACH",
+    "DOCTOR": "DOCTOR",
+    "OBJECTION": "DOCTOR",
+    "KNOWLEDGE": "COACH",
+    "END": "COACH",
+}
+
 
 class MonicaAgent:
     def __init__(self):
-        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model = "gemini-flash-latest"
+        self.text_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        self.live_client = genai.Client(
+            api_key=os.getenv("GEMINI_API_KEY"),
+            http_options={"api_version": "v1alpha"},
+        )
 
-    async def get_reply(self, db_session: Session, monica_session: MonicaSession, user_text: str) -> MonicaReply:
-        # Construct history
-        history = []
-        for msg in monica_session.messages:
-            history.append({
-                "role": "user" if msg.role == "user" else "model",
-                "parts": [{"text": msg.content}]
-            })
+        self.model_text = "gemini-2.0-flash-exp"
+        self.model_live = "models/gemini-2.0-flash-exp"
 
-        # Prepend System Prompt if history is empty or as context
-        # Gemini does better with system instructions
-        
-        # Prepare context about current stage and state
-        context = f"Current Stage: {monica_session.current_stage}\n"
-        context += f"Current Persona: {monica_session.current_persona}\n"
-        context += f"User Info: {monica_session.user_name}, {monica_session.user_role}, {monica_session.headquarter}, {monica_session.division}\n"
-        context += f"State Delta: {json.dumps(monica_session.state_delta)}\n"
-        
-        # Call Gemini
+    # ---------- Helpers ----------
+
+    def _next_stage(self, current: str) -> str:
         try:
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=history + [{"role": "user", "parts": [{"text": f"Context: {context}\nUser says: {user_text}"}]}],
-                config={
-                    "system_instruction": SYSTEM_PROMPT,
-                    "response_mime_type": "application/json",
-                }
-            )
-            
-            result_json = json.loads(response.text)
-            reply = MonicaReply(**result_json)
-            
-            # Record user message
-            user_msg = MonicaMessage(
-                session_id=monica_session.id,
-                role="user",
-                content=user_text,
-                stage=monica_session.current_stage,
-                persona=monica_session.current_persona
-            )
-            db_session.add(user_msg)
-            
-            # Update Session State
-            current_stg = monica_session.current_stage
-            
-            # Record assistant message
-            assistant_msg = MonicaMessage(
-                session_id=monica_session.id,
-                role="assistant",
-                content=reply.reply,
-                stage=current_stg,
-                persona=monica_session.current_persona
-            )
-            db_session.add(assistant_msg)
-            
-            if reply.advance_stage:
-                monica_session.current_stage = self._get_next_stage(monica_session.current_stage)
-                monica_session.current_persona = self._get_persona_for_stage(monica_session.current_stage)
-            
-            # Merge state delta
-            if reply.state_delta:
-                new_state = monica_session.state_delta.copy()
-                new_state.update(reply.state_delta)
-                monica_session.state_delta = new_state
-                
-                # Specifically update user info if we WERE in SETUP
-                if current_stg == "SETUP":
-                    if "name" in reply.state_delta: monica_session.user_name = reply.state_delta["name"]
-                    if "role" in reply.state_delta: monica_session.user_role = reply.state_delta["role"]
-                    if "headquarter" in reply.state_delta: monica_session.headquarter = reply.state_delta["headquarter"]
-                    if "division" in reply.state_delta: monica_session.division = reply.state_delta["division"]
-
-            db_session.commit()
-            return reply
-            
-        except Exception as e:
-            print(f"Error calling Gemini: {e}")
-            raise e
-
-    def _get_next_stage(self, current_stage: str) -> str:
-        stages = ["SETUP", "RCPA", "INTELLIGENCE", "DOCTOR", "OBJECTION", "KNOWLEDGE", "END"]
-        try:
-            idx = stages.index(current_stage)
-            if idx < len(stages) - 1:
-                return stages[idx + 1]
+            idx = STAGE_ORDER.index(current)
+            return STAGE_ORDER[min(idx + 1, len(STAGE_ORDER) - 1)]
         except ValueError:
-            pass
-        return current_stage
+            return current
 
-    def _get_persona_for_stage(self, stage: str) -> str:
-        mapping = {
-            "SETUP": "COACH",
-            "RCPA": "CHEMIST",
-            "INTELLIGENCE": "COACH",
-            "DOCTOR": "DOCTOR",
-            "OBJECTION": "DOCTOR",
-            "KNOWLEDGE": "COACH",
-            "END": "COACH"
+    def _persona(self, stage: str) -> str:
+        return PERSONA_BY_STAGE.get(stage, "COACH")
+
+    def _system_for_stage(self, stage: str) -> str:
+        return SYSTEM_PROMPT + f"\n\nCURRENT STAGE: {stage}\nPERSONA: {self._persona(stage)}"
+
+    def _store_message(self, db: Session, session: MonicaSession, role: str, content: str):
+        msg = MonicaMessage(
+            session_id=session.id,
+            role=role,
+            content=content,
+            stage=session.current_stage,
+            persona=session.current_persona,
+        )
+        db.add(msg)
+        db.commit()
+
+    # ---------- SETUP EXTRACTION ----------
+
+    def _extract_setup_fields(self, session: MonicaSession, text: str, db: Session):
+        t = text.lower()
+
+        if not session.user_name and "pavan" in t:
+            session.user_name = "Pavan"
+
+        if not session.user_role and ("bm" in t or "business manager" in t):
+            session.user_role = "BM"
+
+        if not session.headquarter and ("india" in t or "head office" in t):
+            session.headquarter = "India"
+
+        if not session.division and ("nucleus" in t):
+            session.division = "Nucleus"
+
+        db.commit()
+
+    # ---------- TEXT MODE ----------
+
+    async def get_reply(self, db: Session, session: MonicaSession, text: str) -> MonicaReply:
+        if session.current_stage == "SETUP":
+            self._extract_setup_fields(session, text, db)
+
+        system = self._system_for_stage(session.current_stage)
+
+        prompt = f"""
+{system}
+
+User: {text}
+"""
+
+        response = self.text_client.models.generate_content(
+            model=self.model_text,
+            contents=prompt,
+        )
+
+        raw_reply = response.text or ""
+        reply_text = raw_reply.replace("`advance_stage`", "").strip()
+
+        self._store_message(db, session, "user", text)
+        self._store_message(db, session, "assistant", reply_text)
+
+        advance = bool(self._should_advance(session))
+
+        if advance:
+            old_stage = session.current_stage
+            new_stage = self._next_stage(old_stage)
+
+            session.current_stage = new_stage
+            session.current_persona = self._persona(new_stage)
+            db.commit()
+
+            # SETUP → RCPA bridge
+            if old_stage == "SETUP":
+                scenario = (
+                    f"Thank you, {session.user_name}. Your session is now configured for the "
+                    f"{session.division} division and the product Dexel & Dexel ND.\n\n"
+                    "You are now entering a Retail Chemist RCPA call. I will act as the chemist. "
+                    "Begin by asking me about the doctor's prescribing behaviour."
+                )
+                self._store_message(db, session, "assistant", scenario)
+
+            # RCPA → INTELLIGENCE → DOCTOR
+            if new_stage == "INTELLIGENCE":
+                coaching = (
+                    "You collected the core information well. However, you missed one critical probe: "
+                    "you did not ask about dosing frequency—whether the prescription is daily, weekly, "
+                    "or monthly. This detail is essential because it shapes how you position Dexel to the doctor."
+                )
+                self._store_message(db, session, "assistant", coaching)
+
+                session.current_stage = "DOCTOR"
+                session.current_persona = "DOCTOR"
+                db.commit()
+
+                doctor_prompt = (
+                    "I will now be acting as Dr. Monica. "
+                    "Before you begin your pitch, what questions will you ask to understand my treatment goals?"
+                )
+                self._store_message(db, session, "assistant", doctor_prompt)
+
+        return MonicaReply(
+            reply=reply_text,
+            advance_stage=advance,
+            state_delta={},
+        )
+
+    def _should_advance(self, session: MonicaSession) -> bool:
+        stage = session.current_stage
+
+        if stage == "SETUP":
+            return (
+                session.user_name
+                and session.user_role
+                and session.headquarter
+                and session.division
+            )
+
+        if stage == "RCPA":
+            return True  # user signals end implicitly
+
+        if stage == "DOCTOR":
+            return False
+
+        if stage == "OBJECTION":
+            return False
+
+        return False
+
+    # ---------- VOICE MODE ----------
+
+    def _live_config(self, stage: str):
+        return {
+            "response_modalities": ["AUDIO"],
+            "speech_config": {
+                "voice_config": {"prebuilt_voice_config": {"voice_name": "Puck"}}
+            },
+            "system_instruction": self._system_for_stage(stage),
+            "tools": [
+                {
+                    "function_declarations": [
+                        {
+                            "name": "advance_stage",
+                            "description": "Advance to next stage.",
+                            "parameters": {"type": "OBJECT", "properties": {}},
+                        }
+                    ]
+                }
+            ],
         }
-        return mapping.get(stage, "COACH")
+
+    async def connect_live_session(self, ws: WebSocket, db: Session, session_id: int):
+        await ws.accept()
+
+        monica = db.query(MonicaSession).filter(MonicaSession.id == session_id).first()
+        if not monica:
+            await ws.close(code=4004)
+            return
+
+        config = self._live_config(monica.current_stage)
+
+        async with self.live_client.aio.live.connect(
+            model=self.model_live, config=config
+        ) as live:
+
+            async def recv_client():
+                try:
+                    while True:
+                        msg = await ws.receive()
+                        if "bytes" in msg:
+                            await live.send(
+                                input={"data": msg["bytes"], "mime_type": "audio/pcm"},
+                                end_of_turn=False,
+                            )
+                except Exception:
+                    return
+
+            async def send_client():
+                async for resp in live.receive():
+                    if resp.data:
+                        await ws.send_bytes(resp.data)
+
+                    if resp.server_content:
+                        turn = resp.server_content.model_turn
+                        if not turn:
+                            continue
+
+                        for part in turn.parts:
+                            if part.function_call and part.function_call.name == "advance_stage":
+                                new_stage = self._next_stage(monica.current_stage)
+                                monica.current_stage = new_stage
+                                monica.current_persona = self._persona(new_stage)
+                                db.commit()
+
+                                await ws.send_json({"type": "stage_update", "stage": new_stage})
+
+            await asyncio.gather(recv_client(), send_client())
