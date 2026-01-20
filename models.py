@@ -1,8 +1,8 @@
-# models.py
-from sqlalchemy import Column, Integer, String, JSON, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, String, JSON, ForeignKey, DateTime, Index
 from sqlalchemy.orm import relationship
 import datetime
 from database import Base
+
 
 class Item(Base):
     __tablename__ = "items"
@@ -11,31 +11,49 @@ class Item(Base):
     name = Column(String, index=True)
     description = Column(String)
 
+
 class MonicaSession(Base):
     __tablename__ = "monica_sessions"
 
     id = Column(Integer, primary_key=True, index=True)
+
     user_name = Column(String, index=True, nullable=True)
     user_role = Column(String, nullable=True)
     headquarter = Column(String, nullable=True)
     division = Column(String, nullable=True)
+
     current_stage = Column(String, default="SETUP")
     current_persona = Column(String, default="COACH")
-    state_delta = Column(JSON, default={})
-    metrics = Column(JSON, default={})
+
+    # Use callable defaults for JSON
+    state_delta = Column(JSON, default=dict)
+    metrics = Column(JSON, default=dict)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    
-    messages = relationship("MonicaMessage", back_populates="session")
+
+    messages = relationship(
+        "MonicaMessage",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        lazy="selectin"
+    )
+
 
 class MonicaMessage(Base):
     __tablename__ = "monica_messages"
 
     id = Column(Integer, primary_key=True, index=True)
-    session_id = Column(Integer, ForeignKey("monica_sessions.id"))
-    role = Column(String)  # 'user' or 'assistant'
+    session_id = Column(Integer, ForeignKey("monica_sessions.id", ondelete="CASCADE"), index=True)
+
+    role = Column(String)     # 'user' or 'assistant'
     content = Column(String)
     stage = Column(String)
     persona = Column(String)
+
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
 
     session = relationship("MonicaSession", back_populates="messages")
+
+
+# Optional explicit index (Postgres-friendly)
+Index("ix_monica_messages_session_id", MonicaMessage.session_id)

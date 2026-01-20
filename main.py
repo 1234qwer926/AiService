@@ -39,13 +39,7 @@ monica_agent = MonicaAgent()
 # Monica Routes
 # -------------------------------------------------
 
-@app.post("/monica/session", response_model=MonicaSessionResponse)
-def create_monica_session(db: Session = Depends(get_db)):
-    session = MonicaSession()
-    db.add(session)
-    db.commit()
-    db.refresh(session)
-    return session
+
 
 
 @app.post("/monica/chat", response_model=MonicaReply)
