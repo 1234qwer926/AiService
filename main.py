@@ -90,6 +90,12 @@ def create_monica_session(db: Session = Depends(get_db)):
     db.commit()
 
     return session
+@app.get("/monica/session/{session_id}", response_model=MonicaSessionResponse)
+def get_monica_session(session_id: int, db: Session = Depends(get_db)):
+    session = db.query(MonicaSession).filter(MonicaSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
 
 
 

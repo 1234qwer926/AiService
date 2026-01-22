@@ -35,8 +35,8 @@ const TextPanel = ({ sessionId, onStageUpdate }) => {
                     <div
                         key={i}
                         className={`p-3 rounded-xl max-w-[80%] ${m.role === "user"
-                                ? "ml-auto bg-indigo-600"
-                                : "mr-auto bg-gray-800"
+                            ? "ml-auto bg-indigo-600"
+                            : "mr-auto bg-gray-800"
                             }`}
                     >
                         {m.content}
